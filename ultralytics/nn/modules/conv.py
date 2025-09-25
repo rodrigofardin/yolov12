@@ -6,6 +6,8 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn import init
+from torch.nn.parameter import Parameter
 
 __all__ = (
     "Conv",
@@ -22,6 +24,7 @@ __all__ = (
     "Concat",
     "RepConv",
     "Index",
+    "SqueezeExcitation",
 )
 
 
@@ -408,7 +411,6 @@ class GlobalContext(nn.Module):
 
 
 from timm.layers.create_conv2d import create_conv2d
-
 
 class SqueezeExcitation(nn.Module):
     def __init__(
