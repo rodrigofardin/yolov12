@@ -74,6 +74,9 @@ from .conv import (
     LightConv,
     RepConv,
     SpatialAttention,
+    GlobalContext,
+    SqueezeExcitation,
+    GatherExcite
 )
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
 from .transformer import (
@@ -161,5 +164,8 @@ __all__ = (
     "PSA",
     "TorchVision",
     "Index",
-    "A2C2f"
+    "A2C2f",
+    'GatherExcite',
+    'SqueezeExcitation',
+    'GlobalContext'
 )
