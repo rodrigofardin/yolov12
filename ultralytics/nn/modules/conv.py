@@ -348,3 +348,194 @@ class Index(nn.Module):
         Expects a list of tensors as input.
         """
         return x[self.index]
+
+import torch.nn.functional as F
+from timm.layers.create_act import create_act_layer, get_act_layer
+from timm.layers.helpers import make_divisible
+from timm.layers.mlp import ConvMlp
+from timm.layers.norm import LayerNorm2d
+
+
+class GlobalContext(nn.Module):
+
+    def __init__(self, channels, use_attn=True, fuse_add=False, fuse_scale=True, init_last_zero=False,
+                 rd_ratio=1. / 8, rd_channels=None, rd_divisor=1, act_layer=nn.ReLU, gate_layer='sigmoid'):
+        super(GlobalContext, self).__init__()
+        act_layer = get_act_layer(act_layer)
+
+        self.conv_attn = nn.Conv2d(channels, 1, kernel_size=1, bias=True) if use_attn else None
+
+        if rd_channels is None:
+            rd_channels = make_divisible(channels * rd_ratio, rd_divisor, round_limit=0.)
+        if fuse_add:
+            self.mlp_add = ConvMlp(channels, rd_channels, act_layer=act_layer, norm_layer=LayerNorm2d)
+        else:
+            self.mlp_add = None
+        if fuse_scale:
+            self.mlp_scale = ConvMlp(channels, rd_channels, act_layer=act_layer, norm_layer=LayerNorm2d)
+        else:
+            self.mlp_scale = None
+
+        self.gate = create_act_layer(gate_layer)
+        self.init_last_zero = init_last_zero
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.conv_attn is not None:
+            nn.init.kaiming_normal_(self.conv_attn.weight, mode='fan_in', nonlinearity='relu')
+        if self.mlp_add is not None:
+            nn.init.zeros_(self.mlp_add.fc2.weight)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        if self.conv_attn is not None:
+            attn = self.conv_attn(x).reshape(B, 1, H * W)  # (B, 1, H * W)
+            attn = F.softmax(attn, dim=-1).unsqueeze(3)  # (B, 1, H * W, 1)
+            context = x.reshape(B, C, H * W).unsqueeze(1) @ attn
+            context = context.view(B, C, 1, 1)
+        else:
+            context = x.mean(dim=(2, 3), keepdim=True)
+
+        if self.mlp_scale is not None:
+            mlp_x = self.mlp_scale(context)
+            x = x * self.gate(mlp_x)
+        if self.mlp_add is not None:
+            mlp_x = self.mlp_add(context)
+            x = x + mlp_x
+
+        return x
+
+
+from timm.layers.create_conv2d import create_conv2d
+
+
+class SqueezeExcitation(nn.Module):
+    def __init__(
+            self, channels, feat_size=None, extra_params=False, extent=0, use_mlp=True,
+            rd_ratio=1. / 16, rd_channels=None, rd_divisor=1, add_maxpool=False,
+            act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d, gate_layer='sigmoid'):
+        super(SqueezeExcitation, self).__init__()
+        self.add_maxpool = add_maxpool
+        act_layer = get_act_layer(act_layer)
+        self.extent = extent
+        if extra_params:
+            self.gather = nn.Sequential()
+            if extent == 0:
+                assert feat_size is not None, 'spatial feature size must be specified for global extent w/ params'
+                self.gather.add_module(
+                    'conv1', create_conv2d(channels, channels, kernel_size=feat_size, stride=1, depthwise=True))
+                if norm_layer:
+                    self.gather.add_module(f'norm1', nn.BatchNorm2d(channels))
+            else:
+                assert extent % 2 == 0
+                num_conv = int(math.log2(extent))
+                for i in range(num_conv):
+                    self.gather.add_module(
+                        f'conv{i + 1}',
+                        create_conv2d(channels, channels, kernel_size=3, stride=2, depthwise=True))
+                    if norm_layer:
+                        self.gather.add_module(f'norm{i + 1}', nn.BatchNorm2d(channels))
+                    if i != num_conv - 1:
+                        self.gather.add_module(f'act{i + 1}', act_layer(inplace=True))
+        else:
+            self.gather = None
+            if self.extent == 0:
+                self.gk = 0
+                self.gs = 0
+            else:
+                assert extent % 2 == 0
+                self.gk = self.extent * 2 - 1
+                self.gs = self.extent
+
+        if not rd_channels:
+            rd_channels = make_divisible(channels * rd_ratio, rd_divisor, round_limit=0.)
+        self.mlp = ConvMlp(channels, rd_channels, act_layer=act_layer) if use_mlp else nn.Identity()
+        self.gate = create_act_layer(gate_layer)
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        if self.gather is not None:
+            x_ge = self.gather(x)
+        else:
+            if self.extent == 0:
+                # global extent
+                x_ge = x.mean(dim=(2, 3), keepdims=True)
+                if self.add_maxpool:
+                    # experimental codepath, may remove or change
+                    x_ge = 0.5 * x_ge + 0.5 * x.amax((2, 3), keepdim=True)
+            else:
+                x_ge = F.avg_pool2d(
+                    x, kernel_size=self.gk, stride=self.gs, padding=self.gk // 2, count_include_pad=False)
+                if self.add_maxpool:
+                    # experimental codepath, may remove or change
+                    x_ge = 0.5 * x_ge + 0.5 * F.max_pool2d(x, kernel_size=self.gk, stride=self.gs, padding=self.gk // 2)
+        x_ge = self.mlp(x_ge)
+        if x_ge.shape[-1] != 1 or x_ge.shape[-2] != 1:
+            x_ge = F.interpolate(x_ge, size=size)
+        return x * self.gate(x_ge)
+
+class GatherExcite(nn.Module):
+    def __init__(
+            self, channels, feat_size=None, extra_params=True, extent=4, use_mlp=False,
+            rd_ratio=1. / 16, rd_channels=None, rd_divisor=1, add_maxpool=False,
+            act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d, gate_layer='sigmoid'):
+        super(GatherExcite, self).__init__()
+        self.add_maxpool = add_maxpool
+        act_layer = get_act_layer(act_layer)
+        self.extent = extent
+        if extra_params:
+            self.gather = nn.Sequential()
+            if extent == 0:
+                assert feat_size is not None, 'spatial feature size must be specified for global extent w/ params'
+                self.gather.add_module(
+                    'conv1', create_conv2d(channels, channels, kernel_size=feat_size, stride=1, depthwise=True))
+                if norm_layer:
+                    self.gather.add_module(f'norm1', nn.BatchNorm2d(channels))
+            else:
+                assert extent % 2 == 0
+                num_conv = int(math.log2(extent))
+                for i in range(num_conv):
+                    self.gather.add_module(
+                        f'conv{i + 1}',
+                        create_conv2d(channels, channels, kernel_size=3, stride=2, depthwise=True))
+                    if norm_layer:
+                        self.gather.add_module(f'norm{i + 1}', nn.BatchNorm2d(channels))
+                    if i != num_conv - 1:
+                        self.gather.add_module(f'act{i + 1}', act_layer(inplace=True))
+        else:
+            self.gather = None
+            if self.extent == 0:
+                self.gk = 0
+                self.gs = 0
+            else:
+                assert extent % 2 == 0
+                self.gk = self.extent * 2 - 1
+                self.gs = self.extent
+
+        if not rd_channels:
+            rd_channels = make_divisible(channels * rd_ratio, rd_divisor, round_limit=0.)
+        self.mlp = ConvMlp(channels, rd_channels, act_layer=act_layer) if use_mlp else nn.Identity()
+        self.gate = create_act_layer(gate_layer)
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        if self.gather is not None:
+            x_ge = self.gather(x)
+        else:
+            if self.extent == 0:
+                # global extent
+                x_ge = x.mean(dim=(2, 3), keepdims=True)
+                if self.add_maxpool:
+                    # experimental codepath, may remove or change
+                    x_ge = 0.5 * x_ge + 0.5 * x.amax((2, 3), keepdim=True)
+            else:
+                x_ge = F.avg_pool2d(
+                    x, kernel_size=self.gk, stride=self.gs, padding=self.gk // 2, count_include_pad=False)
+                if self.add_maxpool:
+                    # experimental codepath, may remove or change
+                    x_ge = 0.5 * x_ge + 0.5 * F.max_pool2d(x, kernel_size=self.gk, stride=self.gs, padding=self.gk // 2)
+        x_ge = self.mlp(x_ge)
+        if x_ge.shape[-1] != 1 or x_ge.shape[-2] != 1:
+            x_ge = F.interpolate(x_ge, size=size)
+        return x * self.gate(x_ge)
